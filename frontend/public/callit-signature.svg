@@ -1,0 +1,7 @@
+<svg width="650" height="260" xmlns="http://www.w3.org/2000/svg">
+          <defs><linearGradient id="pathGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+           <stop offset="0%" style="stop-color:#0080ff;stop-opacity:1" />
+           <stop offset="100%" style="stop-color:#8080ff;stop-opacity:1" />
+         </linearGradient></defs>
+          <path d="M 223 220 C 178 182, 118 198, 73 160 C 217 140, 409 180, 553 160 C 553 140, 553 180, 553 160 C 530.5 122, 500.5 138, 478 100 C 424 80, 352 120, 298 100" stroke="url(#pathGradient)" stroke-width="8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>

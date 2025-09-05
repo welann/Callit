@@ -1,8 +1,9 @@
-module contracts::contracts;
+module contracts::lpcontrol;
 
 use sui::balance::{Self, Balance};
 use sui::coin::{Self, Coin};
 use sui::event;
+use sui::sui::SUI;
 use sui::table::{Self, Table};
 
 const E_POOL_PAUSED: u64 = 0;
@@ -17,6 +18,17 @@ const E_INSUFFICIENT_USER_BALANCE: u64 = 8;
 const E_USER_NOT_FOUND: u64 = 9;
 
 // === 事件定义 ===
+public struct AuthControlCreatedEvent has copy, drop {
+    admin: address,
+    authorized_submitters: vector<address>,
+    authorized_liquidators: vector<address>,
+}
+
+public struct LPPoolCreatedEvent has copy, drop {
+    creator: address,
+    treasury_type: address,
+}
+
 public struct LiquidityDepositedEvent has copy, drop {
     depositor: address,
     amount: u64,
@@ -31,7 +43,7 @@ public struct LiquidityWithdrawnEvent has copy, drop {
 }
 
 public struct FundsReservedEvent has copy, drop {
-    option_id: ID,
+    option_id: u64,
     amount: u64,
     remaining_available: u64,
     total_reserved: u64,
@@ -64,6 +76,14 @@ public struct UserProfitPaidEvent has copy, drop {
 
 // === 主要结构体 ===
 
+// 权限控制：指定admin和授权的提交者和清算者
+public struct AuthControl has key {
+    id: UID,
+    admin: address,
+    authorized_submitters: vector<address>,
+    authorized_liquidators: vector<address>,
+}
+
 // 简化的 LP 资金池
 public struct LPPool<phantom T> has key {
     id: UID,
@@ -84,6 +104,45 @@ public struct LPPool<phantom T> has key {
     // === 基础配置 ===
     paused: bool, // 紧急暂停开关
     min_reserve_ratio: u64, // 最小预留比例（防止资金全部被占用）
+}
+
+fun init(ctx: &mut TxContext) {
+    let auth_control = AuthControl {
+        id: object::new(ctx),
+        admin: ctx.sender(),
+        authorized_submitters: vector::empty<address>(),
+        authorized_liquidators: vector::empty<address>(),
+    };
+    assert!(ctx.sender() == auth_control.admin, E_NOT_AUTHORIZED_ADMIN);
+
+    let pool = LPPool<SUI> {
+        id: object::new(ctx),
+        treasury: balance::zero<SUI>(),
+        available_balance: 0,
+        reserved_balance: 0,
+        user_treasury: balance::zero<SUI>(),
+        user_balances: table::new(ctx),
+        total_user_deposits: 0,
+        total_lp_deposits: 0,
+        admin: ctx.sender(),
+        authorized_submitters: vector::empty<address>(),
+        authorized_liquidators: vector::empty<address>(),
+        paused: false,
+        min_reserve_ratio: 10,
+    };
+    
+    event::emit(LPPoolCreatedEvent {
+        creator: ctx.sender(),
+        treasury_type: type_name::display_bytes<SUI>(),
+    });
+    event::emit(AuthControlCreatedEvent {
+        admin: ctx.sender(),
+        authorized_submitters: vector::empty<address>(),
+        authorized_liquidators: vector::empty<address>(),
+    });
+
+    transfer::share_object(pool);
+    transfer::share_object(auth_control);
 }
 
 // === LP流动性管理功能 ===
@@ -211,7 +270,7 @@ public entry fun user_withdraw<T>(pool: &mut LPPool<T>, amount: u64, ctx: &mut T
 // 5. 为期权预留资金（从平台资金中预留）
 public fun reserve_funds<T>(
     pool: &mut LPPool<T>,
-    option_id: ID,
+    option_id: u64,
     potential_payout: u64,
     ctx: &mut TxContext,
 ): bool {
