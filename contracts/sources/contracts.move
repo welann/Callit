@@ -1,5 +1,6 @@
 module contracts::lpcontrol;
 
+use std::string;
 use sui::balance::{Self, Balance};
 use sui::coin::{Self, Coin};
 use sui::event;
@@ -13,9 +14,11 @@ const E_INSUFFICIENT_AVAILABLE_BALANCE: u64 = 3;
 const E_INSUFFICIENT_RESERVE: u64 = 4;
 const E_NOT_AUTHORIZED_SUBMITTER: u64 = 5;
 const E_NOT_AUTHORIZED_LIQUIDATOR: u64 = 6;
-const E_NOT_AUTHORIZED_ADMIN: u64 = 7;
+// const E_NOT_AUTHORIZED_ADMIN: u64 = 7;
 const E_INSUFFICIENT_USER_BALANCE: u64 = 8;
 const E_USER_NOT_FOUND: u64 = 9;
+const E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS: u64 = 10;
+const E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS: u64 = 11;
 
 // === 事件定义 ===
 public struct AuthControlCreatedEvent has copy, drop {
@@ -24,10 +27,15 @@ public struct AuthControlCreatedEvent has copy, drop {
     authorized_liquidators: vector<address>,
 }
 
-public struct LPPoolCreatedEvent has copy, drop {
+public struct LPPoolinitCreatedEvent has copy, drop {
     creator: address,
-    treasury_type: address,
+    sui_create: string::String,
 }
+
+// public struct LPPoolCreatedEvent has copy, drop {
+//     creator: address,
+//     treasury_type: address,
+// }
 
 public struct LiquidityDepositedEvent has copy, drop {
     depositor: address,
@@ -74,15 +82,31 @@ public struct UserProfitPaidEvent has copy, drop {
     new_user_balance: u64,
 }
 
+public struct UserOrderSubmittedEvent has copy, drop {
+    order_id: string::String,
+    user_addr: address,
+    premium_amount: u64,
+    option_id: u64,
+    potential_payout: u64,
+}
+
+public struct AuthorizedSubmitterAddedEvent has copy, drop {
+    submitter_addr: address,
+}
+
+public struct AuthorizedLiquidatorAddedEvent has copy, drop {
+    liquidator_addr: address,
+}
+
 // === 主要结构体 ===
 
 // 权限控制：指定admin和授权的提交者和清算者
-public struct AuthControl has key {
-    id: UID,
-    admin: address,
-    authorized_submitters: vector<address>,
-    authorized_liquidators: vector<address>,
-}
+// public struct AuthControl has key {
+//     id: UID,
+//     admin: address,
+//     authorized_submitters: vector<address>,
+//     authorized_liquidators: vector<address>,
+// }
 
 // 简化的 LP 资金池
 public struct LPPool<phantom T> has key {
@@ -94,9 +118,7 @@ public struct LPPool<phantom T> has key {
     // === 用户资金管理（用户存款，与平台资金分开） ===
     user_treasury: Balance<T>, // 用户存款总资金
     user_balances: Table<address, u64>, // 用户余额记录
-    total_user_deposits: u64, // 用户总存款
     // === LP 管理 ===
-    total_lp_deposits: u64, // LP总存入金额（平台方资金）
     // === 权限控制 ===
     admin: address, // 管理员地址
     authorized_submitters: vector<address>, // 授权的订单提交者
@@ -107,34 +129,37 @@ public struct LPPool<phantom T> has key {
 }
 
 fun init(ctx: &mut TxContext) {
-    let auth_control = AuthControl {
-        id: object::new(ctx),
-        admin: ctx.sender(),
-        authorized_submitters: vector::empty<address>(),
-        authorized_liquidators: vector::empty<address>(),
-    };
-    assert!(ctx.sender() == auth_control.admin, E_NOT_AUTHORIZED_ADMIN);
+    // let mut auth_control = AuthControl {
+    //     id: object::new(ctx),
+    //     admin: ctx.sender(),
+    //     authorized_submitters: vector::empty<address>(),
+    //     authorized_liquidators: vector::empty<address>(),
+    // };
 
-    let pool = LPPool<SUI> {
+    // assert!(ctx.sender() == auth_control.admin, E_NOT_AUTHORIZED_ADMIN);
+
+    let mut pool = LPPool<SUI> {
         id: object::new(ctx),
         treasury: balance::zero<SUI>(),
         available_balance: 0,
         reserved_balance: 0,
         user_treasury: balance::zero<SUI>(),
         user_balances: table::new(ctx),
-        total_user_deposits: 0,
-        total_lp_deposits: 0,
         admin: ctx.sender(),
         authorized_submitters: vector::empty<address>(),
         authorized_liquidators: vector::empty<address>(),
         paused: false,
-        min_reserve_ratio: 10,
+        min_reserve_ratio: 20,
     };
-    
-    event::emit(LPPoolCreatedEvent {
+
+    vector::push_back(&mut pool.authorized_liquidators, ctx.sender());
+    vector::push_back(&mut pool.authorized_submitters, ctx.sender());
+
+    event::emit(LPPoolinitCreatedEvent {
         creator: ctx.sender(),
-        treasury_type: type_name::display_bytes<SUI>(),
+        sui_create: string::utf8(b"SUI"),
     });
+
     event::emit(AuthControlCreatedEvent {
         admin: ctx.sender(),
         authorized_submitters: vector::empty<address>(),
@@ -142,24 +167,56 @@ fun init(ctx: &mut TxContext) {
     });
 
     transfer::share_object(pool);
-    transfer::share_object(auth_control);
+    // transfer::share_object(auth_control);
 }
+// === LP 特权地址管理===
+
+// 1. 添加订单提交者
+entry fun add_authorized_submitter<T>(
+    pool: &mut LPPool<T>,
+    submitter_addr: address,
+    ctx: &TxContext,
+) {
+    assert!(ctx.sender() == pool.admin, E_NOT_ADMIN);
+    assert!(!pool.authorized_submitters.contains(&submitter_addr),E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS);
+    vector::push_back(&mut pool.authorized_submitters, submitter_addr);
+
+    event::emit(AuthorizedSubmitterAddedEvent {
+        submitter_addr,
+    });
+}
+
+// 2. 添加清算者
+entry fun add_authorized_liquidator<T>(
+    pool: &mut LPPool<T>,
+    liquidator_addr: address,
+    ctx: &TxContext,
+) {
+    assert!(ctx.sender() == pool.admin, E_NOT_ADMIN);
+    assert!(!pool.authorized_liquidators.contains(&liquidator_addr),E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS);
+    vector::push_back(&mut pool.authorized_liquidators, liquidator_addr);
+
+    event::emit(AuthorizedLiquidatorAddedEvent {
+        liquidator_addr,
+    });
+}
+
+// 2. 添加清算者
 
 // === LP流动性管理功能 ===
 
 // 1. LP 存入流动性（平台方资金）
-public entry fun deposit_liquidity<T>(pool: &mut LPPool<T>, coins: Coin<T>, ctx: &mut TxContext) {
+entry fun deposit_liquidity<T>(pool: &mut LPPool<T>, coins: Coin<T>, ctx: &TxContext) {
     let depositor_addr = ctx.sender();
     let deposit_amount = coins.value();
 
     // 基础检查
     assert!(!pool.paused, E_POOL_PAUSED);
-    assert!(deposit_amount > 0, E_INVALID_AMOUNT);
+    assert!(coins.value() > 0, E_INVALID_AMOUNT);
 
     // 更新平台资金
     coin::put(&mut pool.treasury, coins);
     pool.available_balance = pool.available_balance + deposit_amount;
-    pool.total_lp_deposits = pool.total_lp_deposits + deposit_amount;
 
     // 发射事件
     event::emit(LiquidityDepositedEvent {
@@ -170,7 +227,7 @@ public entry fun deposit_liquidity<T>(pool: &mut LPPool<T>, coins: Coin<T>, ctx:
 }
 
 // 2. LP 提取流动性（仅管理员可执行，从平台资金中提取）
-public entry fun withdraw_liquidity<T>(
+entry fun withdraw_liquidity<T>(
     pool: &mut LPPool<T>,
     to: address,
     amount: u64,
@@ -187,13 +244,13 @@ public entry fun withdraw_liquidity<T>(
     // 最小预留检查 - 防止池子被完全掏空
     let total_balance = pool.treasury.value();
     let remaining_balance = total_balance - amount;
-    let min_required = pool.reserved_balance * (10000 + pool.min_reserve_ratio) / 10000;
+    let min_required = pool.reserved_balance * pool.min_reserve_ratio/100;
     assert!(remaining_balance >= min_required, E_INSUFFICIENT_RESERVE);
 
     // 执行提取
-    pool.available_balance = pool.available_balance - amount;
     let withdraw_coin = coin::take(&mut pool.treasury, amount, ctx);
     transfer::public_transfer(withdraw_coin, to);
+    pool.available_balance = pool.available_balance - amount;
 
     // 发射事件
     event::emit(LiquidityWithdrawnEvent {
@@ -207,17 +264,16 @@ public entry fun withdraw_liquidity<T>(
 // === 用户资金管理功能 ===
 
 // 3. 用户存入资金
-public entry fun user_deposit<T>(pool: &mut LPPool<T>, coins: Coin<T>, ctx: &mut TxContext) {
+entry fun user_deposit<T>(pool: &mut LPPool<T>, coins: Coin<T>, ctx: &TxContext) {
     let user_addr = ctx.sender();
     let deposit_amount = coins.value();
 
     // 基础检查
     assert!(!pool.paused, E_POOL_PAUSED);
-    assert!(deposit_amount > 0, E_INVALID_AMOUNT);
+    assert!(coins.value() > 0, E_INVALID_AMOUNT);
 
     // 更新用户资金
     coin::put(&mut pool.user_treasury, coins);
-    pool.total_user_deposits = pool.total_user_deposits + deposit_amount;
 
     // 更新用户余额
     if (pool.user_balances.contains(user_addr)) {
@@ -238,7 +294,7 @@ public entry fun user_deposit<T>(pool: &mut LPPool<T>, coins: Coin<T>, ctx: &mut
 }
 
 // 4. 用户提取资金
-public entry fun user_withdraw<T>(pool: &mut LPPool<T>, amount: u64, ctx: &mut TxContext) {
+entry fun user_withdraw<T>(pool: &mut LPPool<T>, amount: u64, ctx: &mut TxContext) {
     let user_addr = ctx.sender();
 
     // 基础检查
@@ -249,13 +305,12 @@ public entry fun user_withdraw<T>(pool: &mut LPPool<T>, amount: u64, ctx: &mut T
     let current_balance = pool.user_balances.borrow_mut(user_addr);
     assert!(*current_balance >= amount, E_INSUFFICIENT_USER_BALANCE);
 
-    // 更新用户余额
-    *current_balance = *current_balance - amount;
-    pool.total_user_deposits = pool.total_user_deposits - amount;
-
     // 从用户资金池中提取
     let withdraw_coin = coin::take(&mut pool.user_treasury, amount, ctx);
     transfer::public_transfer(withdraw_coin, user_addr);
+
+    // 更新用户余额
+    *current_balance = *current_balance - amount;
 
     // 发射事件
     event::emit(UserWithdrewnEvent {
@@ -280,6 +335,7 @@ public fun reserve_funds<T>(
     assert!(!pool.paused, E_POOL_PAUSED);
 
     // 检查是否有足够的可用资金
+    // max potential_payout = user premium * 20
     if (pool.available_balance < potential_payout) {
         return false
     };
@@ -317,14 +373,13 @@ public fun collect_premium<T>(
     let user_balance = pool.user_balances.borrow_mut(user_addr);
     assert!(*user_balance >= premium_amount, E_INSUFFICIENT_USER_BALANCE);
 
-    // 从用户账户扣除权利金
-    *user_balance = *user_balance - premium_amount;
-    pool.total_user_deposits = pool.total_user_deposits - premium_amount;
-
     // 将权利金从用户资金池转移到平台资金池
     let premium_coin = coin::take(&mut pool.user_treasury, premium_amount, ctx);
     coin::put(&mut pool.treasury, premium_coin);
     pool.available_balance = pool.available_balance + premium_amount;
+
+    // 从用户账户扣除权利金
+    *user_balance = *user_balance - premium_amount;
 
     // 发射事件
     event::emit(PremiumCollectedEvent {
@@ -356,7 +411,6 @@ public fun pay_user_profit<T>(
 
     // 更新平台资金状态
     pool.reserved_balance = pool.reserved_balance - profit_amount;
-    pool.total_user_deposits = pool.total_user_deposits + profit_amount;
 
     // 更新用户余额
     if (pool.user_balances.contains(user_addr)) {
@@ -376,7 +430,7 @@ public fun pay_user_profit<T>(
     });
 }
 
-// 8. 期权失败时释放预留资金（预留资金转为平台可用资金）
+// 8. 用户的期权到期失败时释放预留资金（预留资金转为平台可用资金）
 public fun release_reserved_funds<T>(
     pool: &mut LPPool<T>,
     reserved_amount: u64,
@@ -394,16 +448,49 @@ public fun release_reserved_funds<T>(
     pool.available_balance = pool.available_balance + reserved_amount;
 }
 
+// 9. 后端经授权的提交者提交用户的订单信息到合约中
+entry fun submit_user_order<T>(
+    pool: &mut LPPool<T>,
+    order_id: string::String,
+    user_addr: address,
+    premium_amount: u64,
+    option_id: u64,
+    potential_payout: u64,
+    ctx: &mut TxContext,
+) {
+    // 权限检查
+    let submitter_addr = ctx.sender();
+    assert!(pool.authorized_submitters.contains(&submitter_addr), E_NOT_AUTHORIZED_SUBMITTER);
+    assert!(!pool.paused, E_POOL_PAUSED);
+
+    // 检查用户余额
+    assert!(pool.user_balances.contains(user_addr), E_USER_NOT_FOUND);
+    let user_balance = pool.user_balances.borrow_mut(user_addr);
+    assert!(*user_balance >= premium_amount, E_INSUFFICIENT_USER_BALANCE);
+
+    collect_premium(pool, user_addr, premium_amount, ctx);
+
+    let is_reserved = reserve_funds(pool, option_id, potential_payout, ctx);
+    assert!(is_reserved, E_INSUFFICIENT_RESERVE);
+
+    event::emit(UserOrderSubmittedEvent {
+        order_id,
+        user_addr,
+        premium_amount,
+        option_id,
+        potential_payout,
+    });
+}
+
 // === 查询函数 ===
 
 // 获取池子状态
-public fun get_pool_status<T>(pool: &LPPool<T>): (u64, u64, u64, u64, u64) {
+public fun get_pool_status<T>(pool: &LPPool<T>): (u64, u64, u64, u64) {
     (
         pool.treasury.value(), // 平台总资金
         pool.available_balance, // 平台可用资金
         pool.reserved_balance, // 平台预留资金
         pool.user_treasury.value(), // 用户总资金
-        pool.total_user_deposits, // 用户总存款
     )
 }
 
@@ -428,4 +515,14 @@ public fun can_pay_premium<T>(pool: &LPPool<T>, user: address, amount: u64): boo
     } else {
         *pool.user_balances.borrow(user) >= amount
     }
+}
+
+// 检查是否是授权的提交者
+public fun is_authorized_submitter<T>(pool: &LPPool<T>, addr: address): bool {
+    pool.authorized_submitters.contains(&addr)
+}
+
+// 检查是否是授权的清算者
+public fun is_authorized_liquidator<T>(pool: &LPPool<T>, addr: address): bool {
+    pool.authorized_liquidators.contains(&addr)
 }
