@@ -1,9 +1,9 @@
 module contracts::lpcontrol;
 
-use std::string;
+use std::string::{Self, String};
 use sui::balance::{Self, Balance};
 use sui::coin::{Self, Coin};
-use sui::event;
+use sui::event::{Self, emit};
 use sui::sui::SUI;
 use sui::table::{Self, Table};
 
@@ -14,7 +14,7 @@ const E_INSUFFICIENT_AVAILABLE_BALANCE: u64 = 3;
 const E_INSUFFICIENT_RESERVE: u64 = 4;
 const E_NOT_AUTHORIZED_SUBMITTER: u64 = 5;
 const E_NOT_AUTHORIZED_LIQUIDATOR: u64 = 6;
-// const E_NOT_AUTHORIZED_ADMIN: u64 = 7;
+const E_NOT_AUTHORIZED_ADMIN: u64 = 7;
 const E_INSUFFICIENT_USER_BALANCE: u64 = 8;
 const E_USER_NOT_FOUND: u64 = 9;
 const E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS: u64 = 10;
@@ -32,10 +32,10 @@ public struct LPPoolinitCreatedEvent has copy, drop {
     sui_create: string::String,
 }
 
-// public struct LPPoolCreatedEvent has copy, drop {
-//     creator: address,
-//     treasury_type: address,
-// }
+public struct LPPoolCreatedEvent has copy, drop {
+    creator: address,
+    treasury_type: string::String,
+}
 
 public struct LiquidityDepositedEvent has copy, drop {
     depositor: address,
@@ -83,11 +83,21 @@ public struct UserProfitPaidEvent has copy, drop {
 }
 
 public struct UserOrderSubmittedEvent has copy, drop {
-    order_id: string::String,
+    order_id: String,
     user_addr: address,
     premium_amount: u64,
     option_id: u64,
     potential_payout: u64,
+}
+
+public struct OrderLiquidatedEvent has copy, drop {
+        option_id:u64,
+        user_addr:address,
+        liquidator: address,
+        reserved_released_amount: u64,
+        payout_to_user_amount: u64,
+        new_available_balance: u64,
+        new_reserved_balance: u64,
 }
 
 public struct AuthorizedSubmitterAddedEvent has copy, drop {
@@ -98,15 +108,17 @@ public struct AuthorizedLiquidatorAddedEvent has copy, drop {
     liquidator_addr: address,
 }
 
+public struct AdminAddedEvent has copy, drop {
+    admin_addr: address,
+}
+
 // === 主要结构体 ===
 
 // 权限控制：指定admin和授权的提交者和清算者
-// public struct AuthControl has key {
-//     id: UID,
-//     admin: address,
-//     authorized_submitters: vector<address>,
-//     authorized_liquidators: vector<address>,
-// }
+public struct AuthControl has key {
+    id: UID,
+    admin: vector<address>,
+}
 
 // 简化的 LP 资金池
 public struct LPPool<phantom T> has key {
@@ -129,14 +141,11 @@ public struct LPPool<phantom T> has key {
 }
 
 fun init(ctx: &mut TxContext) {
-    // let mut auth_control = AuthControl {
-    //     id: object::new(ctx),
-    //     admin: ctx.sender(),
-    //     authorized_submitters: vector::empty<address>(),
-    //     authorized_liquidators: vector::empty<address>(),
-    // };
-
-    // assert!(ctx.sender() == auth_control.admin, E_NOT_AUTHORIZED_ADMIN);
+    let mut auth_control = AuthControl {
+        id: object::new(ctx),
+        admin: vector::empty<address>(),
+    };
+    vector::push_back(&mut auth_control.admin, ctx.sender());
 
     let mut pool = LPPool<SUI> {
         id: object::new(ctx),
@@ -167,7 +176,7 @@ fun init(ctx: &mut TxContext) {
     });
 
     transfer::share_object(pool);
-    // transfer::share_object(auth_control);
+    transfer::share_object(auth_control);
 }
 // === LP 特权地址管理===
 
@@ -178,7 +187,10 @@ entry fun add_authorized_submitter<T>(
     ctx: &TxContext,
 ) {
     assert!(ctx.sender() == pool.admin, E_NOT_ADMIN);
-    assert!(!pool.authorized_submitters.contains(&submitter_addr),E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS);
+    assert!(
+        !pool.authorized_submitters.contains(&submitter_addr),
+        E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS,
+    );
     vector::push_back(&mut pool.authorized_submitters, submitter_addr);
 
     event::emit(AuthorizedSubmitterAddedEvent {
@@ -193,7 +205,10 @@ entry fun add_authorized_liquidator<T>(
     ctx: &TxContext,
 ) {
     assert!(ctx.sender() == pool.admin, E_NOT_ADMIN);
-    assert!(!pool.authorized_liquidators.contains(&liquidator_addr),E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS);
+    assert!(
+        !pool.authorized_liquidators.contains(&liquidator_addr),
+        E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS,
+    );
     vector::push_back(&mut pool.authorized_liquidators, liquidator_addr);
 
     event::emit(AuthorizedLiquidatorAddedEvent {
@@ -201,7 +216,14 @@ entry fun add_authorized_liquidator<T>(
     });
 }
 
-// 2. 添加清算者
+// 3. 添加管理员
+entry fun add_admin(auth_control: &mut AuthControl, new_admin_addr: address, ctx: &TxContext) {
+    assert!(auth_control.admin.contains(&ctx.sender()), E_NOT_ADMIN);
+    vector::push_back(&mut auth_control.admin, new_admin_addr);
+    emit(AdminAddedEvent {
+        admin_addr: new_admin_addr,
+    });
+}
 
 // === LP流动性管理功能 ===
 
@@ -482,6 +504,85 @@ entry fun submit_user_order<T>(
     });
 }
 
+// 10. 对过期订单进行清算
+entry fun liquidate_expired_order<T>(
+    pool: &mut LPPool<T>,
+    option_id: u64,
+    user_addr: address,
+    initial_reserved_amount: u64, // 为该期权最初预留的资金量
+    payout_amount: u64,           // 如果用户盈利，支付给用户的金额 (如果亏损则为 0)
+    ctx: &mut TxContext,
+) {
+    // 权限检查
+    let liquidator_addr = ctx.sender();
+    assert!(pool.authorized_liquidators.contains(&liquidator_addr), E_NOT_AUTHORIZED_LIQUIDATOR);
+    assert!(!pool.paused, E_POOL_PAUSED);
+    assert!(initial_reserved_amount > 0, E_INVALID_AMOUNT); // 必须有预留资金
+
+    // 确保支付金额不超过最初预留金额
+    assert!(payout_amount <= initial_reserved_amount, E_INVALID_AMOUNT);
+
+    // 如果有盈利支付，则调用 pay_user_profit
+    // pay_user_profit 会将资金从 treasury 转移到 user_treasury，并更新 user_balances
+    // 同时，它会从 pool.reserved_balance 中扣除 payout_amount
+    if (payout_amount > 0) {
+        pay_user_profit(pool, user_addr, payout_amount, ctx);
+    };
+
+    // 释放剩余的预留资金到可用资金池
+    // initial_reserved_amount - payout_amount 是这笔订单未支付给用户但仍被预留的资金
+    let amount_to_release = initial_reserved_amount - payout_amount;
+    if (amount_to_release > 0) {
+        // release_reserved_funds 会将资金从 pool.reserved_balance 转移到 pool.available_balance
+        release_reserved_funds(pool, amount_to_release, ctx);
+    };
+
+    // 发射清算事件
+    event::emit(OrderLiquidatedEvent {
+        option_id,
+        user_addr,
+        liquidator: liquidator_addr,
+        reserved_released_amount: amount_to_release,
+        payout_to_user_amount: payout_amount,
+        new_available_balance: pool.available_balance,
+        new_reserved_balance: pool.reserved_balance,
+    });
+}
+
+
+// 11. 新建一个池子
+entry fun create_new_pool<T>(
+    auth_control: &AuthControl,
+    new_coin_type: String,
+    ctx: &mut TxContext,
+) {
+    assert!(auth_control.admin.contains(&ctx.sender()), E_NOT_AUTHORIZED_ADMIN);
+
+    let mut new_pool = LPPool<T> {
+        id: object::new(ctx),
+        treasury: balance::zero<T>(),
+        available_balance: 0,
+        reserved_balance: 0,
+        user_treasury: balance::zero<T>(),
+        user_balances: table::new(ctx),
+        admin: ctx.sender(),
+        authorized_submitters: vector::empty<address>(),
+        authorized_liquidators: vector::empty<address>(),
+        paused: false,
+        min_reserve_ratio: 20,
+    };
+
+    vector::push_back(&mut new_pool.authorized_liquidators, ctx.sender());
+    vector::push_back(&mut new_pool.authorized_submitters, ctx.sender());
+
+    event::emit(LPPoolCreatedEvent {
+        creator: ctx.sender(),
+        treasury_type: new_coin_type,
+    });
+
+    transfer::share_object(new_pool);
+}
+
 // === 查询函数 ===
 
 // 获取池子状态
@@ -526,3 +627,100 @@ public fun is_authorized_submitter<T>(pool: &LPPool<T>, addr: address): bool {
 public fun is_authorized_liquidator<T>(pool: &LPPool<T>, addr: address): bool {
     pool.authorized_liquidators.contains(&addr)
 }
+
+//=======测试代码=======
+#[test_only]
+use sui::test_scenario as ts;
+
+// 定义测试用户
+#[test_only]
+const ADMIN: address = @0x1;
+#[test_only]
+const SUBMITTER1: address = @0x2;
+#[test_only]
+const LIQUIDATOR1: address = @0x3;
+#[test_only]
+const USER1: address = @0x4;
+
+// 初始化的测试
+#[test]
+fun test_contracts_init() {
+    let mut ts = ts::begin(ADMIN);
+    {
+        init(ts.ctx());
+    };
+
+    ts.next_tx(ADMIN);
+    let pool: LPPool<SUI> = ts.take_shared();
+
+    // 验证ADMIN是否在授权提交者和清算者列表中
+    assert!(is_authorized_submitter(&pool, ADMIN), E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS);
+    assert!(is_authorized_liquidator(&pool, ADMIN), E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS);
+    ts::return_shared(pool);
+    ts.end();
+}
+
+#[test, expected_failure(abort_code = E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS)]
+fun test_add_authorized_submitter() {
+    let mut ts = ts::begin(ADMIN);
+    {
+        init(ts.ctx());
+    };
+
+    ts.next_tx(ADMIN);
+
+    // 获取共享对象 LPPool
+    let mut pool: LPPool<SUI> = ts.take_shared();
+    {
+        ts::next_tx(&mut ts, ADMIN);
+        let ctx = ts.ctx();
+        add_authorized_submitter(&mut pool, SUBMITTER1, ctx);
+        // 验证 SUBMITTER1 已被添加
+        assert!(is_authorized_submitter(&pool, SUBMITTER1), E_AUTHORIZED_SUBMITTER_ALREADY_EXISTS);
+
+        add_authorized_submitter(&mut pool, SUBMITTER1, ctx);
+    };
+    ts::return_shared(pool);
+    ts.end();
+}
+
+#[test, expected_failure(abort_code = E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS)]
+fun test_add_authorized_liquidator() {
+    let mut ts = ts::begin(ADMIN);
+    {
+        init(ts.ctx());
+    };
+
+    ts.next_tx(ADMIN);
+
+    // 获取共享对象 LPPool
+    let mut pool: LPPool<SUI> = ts.take_shared();
+    {
+        ts::next_tx(&mut ts, ADMIN);
+        let ctx = ts.ctx();
+        add_authorized_liquidator(&mut pool, LIQUIDATOR1, ctx);
+        // 验证 LIQUIDATOR1 已被添加
+        assert!(
+            is_authorized_liquidator(&pool, LIQUIDATOR1),
+            E_AUTHORIZED_LIQUIDATOR_ALREADY_EXISTS,
+        );
+
+        add_authorized_liquidator(&mut pool, LIQUIDATOR1, ctx);
+    };
+    ts::return_shared(pool);
+    ts.end();
+}
+
+// sui client call \
+//   --package 0x8bef74c68ec9fccb92f517ce8f9dba6ff81fbd6790d5397947647bc26a4bf246 \
+//   --module lpcontrol \
+//   --function is_authorized_liquidator \
+//   --type-args "0x2::sui::SUI" \
+//   --args 0x738eeacc9ea2ba03ba1570ed657cb89ea5a84453b514c4a48b4e7281b1472bbb  0x56e6362fd530999ec320fcf8b7ab06d9175fdd49ac32aec3ef3d924b7f1cbaa0
+
+// sui client call \
+//   --package 0x8bef74c68ec9fccb92f517ce8f9dba6ff81fbd6790d5397947647bc26a4bf246 \
+//   --module lpcontrol \
+//   --function add_authorized_liquidator \
+//   --type-args "0x2::sui::SUI" \
+//   --args 0x738eeacc9ea2ba03ba1570ed657cb89ea5a84453b514c4a48b4e7281b1472bbb  0x950c70f8d82f7e7fef4e2fd46fe714e091a35b7e0c015552b5971966630b2d9f
